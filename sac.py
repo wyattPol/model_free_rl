@@ -9,6 +9,7 @@ import gymnasium as gym
 from collections import deque, namedtuple
 import random
 import wandb
+import time
 
 # GPU Check Function
 def check_gpu():
