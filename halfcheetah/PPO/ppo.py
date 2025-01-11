@@ -51,7 +51,6 @@ class Actor(nn.Module):
         if not isinstance(state, torch.Tensor):
             state = torch.tensor(state, dtype=torch.float32)
         
-        # Ensure state is 2D (batch, features)
         if state.ndim == 1:
             state = state.unsqueeze(0)
         
@@ -75,7 +74,6 @@ class Critic(nn.Module):
         if not isinstance(state, torch.Tensor):
             state = torch.tensor(state, dtype=torch.float32)
         
-        # Ensure state is 2D (batch, features)
         if state.ndim == 1:
             state = state.unsqueeze(0)
         
@@ -174,7 +172,6 @@ class PPO:
         self.episode_lengths = []
         
         for episode in range(max_episodes):
-            # Reset the environment with a seed
             state, _ = self.env.reset(seed=seed)  
             episode_reward = 0
             episode_length = 0
@@ -209,21 +206,16 @@ class PPO:
             next_value = self.critic(state).item()
             advantages, returns = self.compute_gae(rewards, values, next_value, dones)
             
-            # Convert to tensors
             states = torch.FloatTensor(np.array(states))
             actions = torch.FloatTensor(np.array(actions))
             old_log_probs = torch.FloatTensor(log_probs)
             
-            # Update policy and value networks
             self.update(states, actions, old_log_probs, advantages, returns)
             
-            # Store episode metrics for later analysis
             self.episode_rewards.append(episode_reward)
             self.episode_lengths.append(episode_length)
             
-            # Advanced logging with detailed metrics
             metrics = {
-                # Reward Metrics
                 "Reward/Episode": episode_reward,
                 "Reward/Cumulative_Mean": np.mean(self.episode_rewards),
                 "Reward/Cumulative_Std": np.std(self.episode_rewards),
@@ -234,23 +226,16 @@ class PPO:
                 
                 # Policy Stability
                 "Stability/Reward_Variability": np.std(self.episode_rewards[-50:]) if len(self.episode_rewards) >= 50 else 0,
-                
-                # Episode Tracking
                 "Episode": episode
             }
             
-            # Log to wandb
             wandb.log(metrics)
             
-            # Print progress
             if episode % 10 == 0:
                 print(f"Episode {episode}, Reward: {episode_reward}, Length: {episode_length}")
             
-            # Save model at specified intervals
             if episode > 0 and episode % save_interval == 0:
                 self.save_model(episode)
-                
-                # Log computational metrics at save points
                 current_time = time.time()
                 training_duration = current_time - training_start_time
                 wandb.log({
@@ -258,11 +243,9 @@ class PPO:
                     "Computation/Episodes_Completed": episode
                 })
         
-        # Final computations and logging
         training_end_time = time.time()
         total_training_time = training_end_time - training_start_time
         
-        # Final metrics report
         final_metrics = {
             "Final/Total_Training_Time": total_training_time,
             "Final/Total_Episodes": max_episodes,
@@ -284,7 +267,6 @@ class PPO:
         Args:
             episode (int): Current episode number for filename
         """
-        # Prepare model save paths
         actor_path = f'saved_models/actor_ep{episode}.pth'
         critic_path = f'saved_models/critic_ep{episode}.pth'
         
@@ -300,7 +282,6 @@ class PPO:
             'optimizer_state_dict': self.critic_optimizer.state_dict(),
         }, critic_path)
         
-        # Log model save
         print(f"Models saved at episode {episode}")
         wandb.save(actor_path)
         wandb.save(critic_path)
@@ -325,9 +306,9 @@ class PPO:
         self.critic_optimizer.load_state_dict(critic_checkpoint['optimizer_state_dict'])
         
         print(f"Models loaded from {actor_path} and {critic_path}")
+        
 # Training
 def main():
-    # Configure wandb with more detailed run tracking
     wandb.init(
         project="[[ppocheetah]]",
         config={
@@ -343,17 +324,10 @@ def main():
         }
     )
 
-    # Create environment
     env = gym.make('HalfCheetah-v4')
-    
-    # Set seed for reproducibility
     set_seed(45)
-    
-    # Initialize agent and train
     agent = PPO(env)
     rewards = agent.train(seed=45, max_episodes=5000, save_interval=500)
-    
-    # Finish wandb run
     wandb.finish()
 
 if __name__ == "__main__":
