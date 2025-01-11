@@ -1,1 +1,1 @@
-checkpoints of PPO halfcheetah
+checkpoints of SAC halfcheetah
