@@ -86,7 +86,6 @@ class Critic(nn.Module):
             nn.ReLU(),
             nn.Linear(256, 1)
         )
-        # Initialize final layer with smaller weights
         nn.init.orthogonal_(self.net[-1].weight, gain=1.0)
         
     def forward(self, state):
@@ -105,19 +104,15 @@ class PPO:
         self.actor = Actor(self.state_dim, self.action_dim)
         self.critic = Critic(self.state_dim)
         
-        # Smaller learning rates for stability
         self.actor_optimizer = optim.Adam(self.actor.parameters(), lr=1e-5, eps=1e-5)
         self.critic_optimizer = optim.Adam(self.critic.parameters(), lr=3e-5, eps=1e-5)
         
-        # Modified hyperparameters for Ant
-        self.clip_ratio = 0.2  # Smaller clip ratio
+        self.clip_ratio = 0.2  
         self.gamma = 0.99
         self.lam = 0.95
-        self.batch_size = 128  # Larger batch size
+        self.batch_size = 128  
         self.n_epochs = 8
-        self.max_grad_norm = 0.5  # Add gradient clipping
-        
-        # Value loss coefficient
+        self.max_grad_norm = 0.5  
         self.vf_coef = 0.5
         
         # Tracking metrics
@@ -133,12 +128,12 @@ class PPO:
             mean, std = self.actor(state)
             dist = Normal(mean, std)
             action = dist.sample()
-            action = torch.clamp(action, -1.0, 1.0)  # Clip actions
+            action = torch.clamp(action, -1.0, 1.0) 
             log_prob = dist.log_prob(action).sum(dim=-1)
         return action.detach().numpy()[0], log_prob.detach()[0]
     
     def update(self, states, actions, old_log_probs, advantages, returns):
-        # Convert to tensors if not already
+   
         states = torch.FloatTensor(states)
         actions = torch.FloatTensor(actions)
         old_log_probs = torch.FloatTensor(old_log_probs)
@@ -174,7 +169,6 @@ class PPO:
                 values = self.critic(batch_states).squeeze()
                 critic_loss = self.vf_coef * ((values - batch_returns) ** 2).mean()
                 
-                # Update networks with gradient clipping
                 self.actor_optimizer.zero_grad()
                 actor_loss.backward()
                 torch.nn.utils.clip_grad_norm_(self.actor.parameters(), self.max_grad_norm)
@@ -187,9 +181,6 @@ class PPO:
     
     def train(self, max_episodes=100000, steps_per_episode=1000, seed=45):
         set_seed(seed)
-        
-        # Create directory for saved models if it doesn't exist
-        os.makedirs('saved_models', exist_ok=True)
         
         for episode in range(max_episodes):
             state, _ = self.env.reset(seed=seed + episode)
@@ -205,7 +196,6 @@ class PPO:
                 next_state, reward, terminated, truncated, _ = self.env.step(action)
                 done = terminated or truncated
                 
-                # Store transition
                 states.append(state)
                 actions.append(action)
                 rewards.append(reward)
@@ -219,51 +209,60 @@ class PPO:
                 
                 if done:
                     break
-            
-            # Update policy
+        
             next_value = self.critic(state).item()
             advantages, returns = self.compute_gae(rewards, values, next_value, dones)
             self.update(states, actions, log_probs, advantages, returns)
             
-            # Logging
             self.episode_rewards.append(episode_reward)
             self.episode_lengths.append(episode_length)
+
+            if episode > 0 and episode % 200 == 0:
+                self.save_model(episode)
             
-            # Save model every 1000 episodes
-            if (episode + 1) % 1000 == 0:
-                self.save_model(episode + 1)
-            
+
             if episode % 10 == 0:
                 avg_reward = np.mean(self.episode_rewards[-100:])
                 print(f"Episode {episode}, Reward: {episode_reward:.2f}, Avg Reward: {avg_reward:.2f}")
                 
                 wandb.log({
+                   
                     "reward": episode_reward,
                     "avg_reward": avg_reward,
+                    
                 })
         
         return self.episode_rewards
         
-    
+        
     def compute_gae(self, rewards, values, next_value, dones):
         advantages = []
         gae = 0
-        
+
         for t in reversed(range(len(rewards))):
             if t == len(rewards) - 1:
                 next_value_t = next_value
             else:
                 next_value_t = values[t + 1]
-            
+
+            # Temporal Difference (TD) Error
             delta = rewards[t] + self.gamma * next_value_t * (1 - dones[t]) - values[t]
-            gae = delta + self.gamma * self.lam * (1 - dones[t]) * gae
-            advantages.insert(0, gae)
             
+            # GAE
+            gae = delta + self.gamma * self.lam * (1 - dones[t]) * gae
+            
+            # Insert the calculated advantage at the beginning (for efficient reverse order)
+            advantages.insert(0, gae)
+
+        #compute returns
         advantages = torch.FloatTensor(advantages)
         returns = advantages + torch.FloatTensor(values)
+
+        # norm ads
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
-        
+
         return advantages, returns
+
     
 
 
@@ -274,23 +273,20 @@ class PPO:
         Args:
             episode (int): Current episode number for filename
         """
-        # Prepare model save paths
+
         actor_path = f'saved_models/actor_ep{episode}.pth'
         critic_path = f'saved_models/critic_ep{episode}.pth'
         
-        # Save actor model
         torch.save({
             'model_state_dict': self.actor.state_dict(),
             'optimizer_state_dict': self.actor_optimizer.state_dict(),
         }, actor_path)
         
-        # Save critic model
         torch.save({
             'model_state_dict': self.critic.state_dict(),
             'optimizer_state_dict': self.critic_optimizer.state_dict(),
         }, critic_path)
         
-        # Log model save
         print(f"Models saved at episode {episode}")
         wandb.save(actor_path)
         wandb.save(critic_path)
@@ -315,7 +311,7 @@ class PPO:
         self.critic_optimizer.load_state_dict(critic_checkpoint['optimizer_state_dict'])
         
         print(f"Models loaded from {actor_path} and {critic_path}")
-# Training
+
 def main():
     wandb.init(
         project="ppo_ant",
