@@ -11,7 +11,6 @@ import random
 import wandb
 import time
 
-# GPU Check Function
 def check_gpu():
     if torch.cuda.is_available():
         device = torch.device("cuda")
@@ -24,7 +23,6 @@ def check_gpu():
         print("\nNo GPU available. Using CPU instead.")
         return torch.device("cpu")
 
-# Set seeds for reproducibility
 def set_seeds(seed=0):
     torch.manual_seed(seed)
     np.random.seed(seed)
@@ -33,7 +31,7 @@ def set_seeds(seed=0):
         torch.cuda.manual_seed(seed)
         torch.cuda.manual_seed_all(seed)
         torch.backends.cudnn.deterministic = True
-# Actor Network
+
 class WandBConfig:
     def __init__(self):
         self.api_key = "a0fc75f04fa27bc24039cf264e6500367853626f"
@@ -126,7 +124,7 @@ class ReplayBuffer:
     def __len__(self):
         return len(self.buffer)
 
-# SAC Agent
+
 class SAC:
     def __init__(
         self, 
@@ -232,32 +230,25 @@ class SAC:
         for param, target_param in zip(self.critic.parameters(), self.critic_target.parameters()):
             target_param.data.copy_(self.tau * param.data + (1 - self.tau) * target_param.data)
 
-# Training loop
 def train_sac(
     save_interval=100,  # Save every 100 episodes
     max_episodes=1000,
     max_steps=1000,
     eval_freq=20
 ):
-    # Set seeds
     set_seeds(45)
-    
-    # Initialize WandB
     wandb_config = WandBConfig()
     wandb_config.setup()
     
-    # Environment setup
     env = gym.make("HalfCheetah-v4")
     
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     max_action = float(env.action_space.high[0])
     
-    # Check GPU and set device
     device = check_gpu()
     print(f"\nTraining will run on: {device}")
-    
-    # Initialize agent
+
     agent = SAC(
         state_dim=state_dim,
         action_dim=action_dim,
@@ -284,10 +275,8 @@ def train_sac(
             next_state, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
             
-            # Store transition in replay buffer
             agent.memory.push(state, action, reward, next_state, float(done))
             
-            # Train agent
             if len(agent.memory) > agent.batch_size:
                 agent.train(agent.memory)
             
@@ -301,7 +290,6 @@ def train_sac(
         
         agent.episode_rewards.append(episode_reward)
         
-        # Log metrics to WandB
         metrics = {
             "Reward/Episode": episode_reward,
             "Reward/Cumulative_Mean": np.mean(agent.episode_rewards),
@@ -313,7 +301,6 @@ def train_sac(
         }
         wandb.log(metrics)
         
-        # Print progress
         if (episode + 1) % eval_freq == 0:
             avg_reward = np.mean(agent.episode_rewards[-eval_freq:])
             print(f"Episode {episode+1}: Average Reward = {avg_reward:.2f}")
@@ -327,8 +314,7 @@ def train_sac(
                 "Computation/Training_Time_Seconds": training_duration,
                 "Computation/Episodes_Completed": episode + 1
             })
-    
-    # Final save at end of training
+
     agent.save_model(max_episodes)
     wandb.finish()
     return agent
