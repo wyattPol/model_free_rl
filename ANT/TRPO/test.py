@@ -3,6 +3,7 @@ import torch
 import gymnasium as gym
 import numpy as np
 import time
+
 from trpo import TRPO, Policy, Value  
 
 def evaluate_model(checkpoint_path, num_episodes=5, render=True):
@@ -14,30 +15,34 @@ def evaluate_model(checkpoint_path, num_episodes=5, render=True):
         num_episodes (int): Number of episodes to evaluate
         render (bool): Whether to render the environment
     """
+
     env = gym.make("Ant-v4", render_mode="human" if render else None)
     
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
     
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-        agent = TRPO(
+    
+
+    agent = TRPO(
         state_dim=state_dim,
         action_dim=action_dim,
         device=device,
         gamma=0.99,
-        tau=0.95,
-        max_kl=0.005,
-        damping=0.2,
-        batch_size=4096,
-        value_lr=1e-4
+        tau=0.97,
+        max_kl=0.005,      
+        damping=0.1,     
+        batch_size=2048,  
+        value_lr=3e-4    
     )
     
+
     try:
         checkpoint = torch.load(checkpoint_path, map_location=device)
         episode = checkpoint['episode']
         
-        # Load state dicts with device mapping
         agent.policy.load_state_dict(checkpoint['policy_state_dict'])
         agent.value.load_state_dict(checkpoint['value_state_dict'])
         
@@ -46,11 +51,9 @@ def evaluate_model(checkpoint_path, num_episodes=5, render=True):
         print(f"Error loading checkpoint: {e}")
         return None, None
     
-    # Ensure models are in eval mode
     agent.policy.eval()
     agent.value.eval()
     
-
     eval_rewards = []
     
     for ep in range(num_episodes):
@@ -59,13 +62,13 @@ def evaluate_model(checkpoint_path, num_episodes=5, render=True):
         done = False
         
         while not done:
-    
+            # Select action deterministically for evaluation
             with torch.no_grad():
                 action = agent.select_action(state, evaluate=True)
             
             next_state, reward, terminated, truncated, _ = env.step(action)
             done = terminated or truncated
-            
+            reward = reward / 10.0 
             episode_reward += reward
             state = next_state
             
@@ -94,7 +97,7 @@ def evaluate_multiple_checkpoints(checkpoint_dir, episode_interval=100, num_epis
         episode_interval (int): Interval between checkpoints to evaluate
         num_episodes (int): Number of episodes to evaluate per checkpoint
     """
-   
+
     checkpoint_files = [f for f in os.listdir(checkpoint_dir) if f.endswith('.pt')]
     checkpoint_files.sort(key=lambda x: int(x.split('_')[-1].split('.')[0]))
     
@@ -120,6 +123,7 @@ def evaluate_multiple_checkpoints(checkpoint_dir, episode_interval=100, num_epis
     return results
 
 if __name__ == "__main__":
+
     checkpoint_dir = "checkpoints"  # Directory containing your saved checkpoints
     
     # Option 1: Evaluate a single checkpoint
