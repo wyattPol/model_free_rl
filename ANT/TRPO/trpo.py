@@ -10,6 +10,8 @@ import wandb
 import time
 from collections import deque
 import random
+from copy import deepcopy
+
 
 def check_gpu():
     if torch.cuda.is_available():
@@ -54,6 +56,7 @@ class Policy(nn.Module):
         self.mean = nn.Linear(256, action_dim)
         self.log_std = nn.Parameter(torch.zeros(action_dim))
         
+        # Initialize weights using orthogonal initialization
         for layer in self.net:
             if isinstance(layer, nn.Linear):
                 nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
@@ -107,7 +110,7 @@ class TRPO:
         device,
         gamma=0.99,
         tau=0.97,
-        max_kl=0.01,
+        max_kl=0.005,
         damping=0.1,
         batch_size=2048,
         value_lr=3e-4
@@ -132,6 +135,21 @@ class TRPO:
             action = self.policy.get_action(state, deterministic=evaluate)
         return action.cpu().numpy()[0]
 
+    def get_entropy(self, states):
+        """Calculate policy entropy for given states"""
+        with torch.no_grad():
+            mean, std = self.policy(states)
+            dist = Normal(mean, std)
+            entropy = dist.entropy().mean()
+            return entropy.item()
+
+    def get_kl(self, states, old_dist):
+        """Compute the KL divergence between old and new distributions"""
+        mean, std = self.policy(states)
+        dist = Normal(mean, std)
+        kl = torch.distributions.kl_divergence(old_dist, dist).sum(-1).mean()
+        return kl
+
     def train(self, memory):
         batch = memory.get_batch()
         states = torch.FloatTensor(batch['states']).to(self.device)
@@ -143,8 +161,7 @@ class TRPO:
         with torch.no_grad():
             values = self.value(states)
             next_values = self.value(next_states)
-            
-            # GAE calculation
+            entropy = self.get_entropy(states)
             advantages = torch.zeros_like(rewards)
             lastgaelam = 0
             for t in reversed(range(len(rewards))):
@@ -157,23 +174,22 @@ class TRPO:
                 delta = rewards[t] + self.gamma * nextvalues * nextnonterminal - values[t]
                 advantages[t] = lastgaelam = delta + self.gamma * self.tau * nextnonterminal * lastgaelam
             returns = advantages + values
-            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+            log_probs = self.policy.get_log_prob(states, actions)
 
+            # Compute old log probs (store this for later comparison)
+            old_log_probs = log_probs.detach() 
+            advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+          
         for _ in range(10):
             value_loss = (self.value(states) - returns).pow(2).mean()
             self.value_optimizer.zero_grad()
             value_loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.value.parameters(), max_norm=0.5)  # Add this line
             self.value_optimizer.step()
 
         with torch.no_grad():
-            old_log_probs = self.policy.get_log_prob(states, actions)
-
-        def get_kl():
-            mean, std = self.policy(states)
-            old_mean, old_std = self.policy(states.detach())
+            old_mean, old_std = self.policy(states)
             old_dist = Normal(old_mean, old_std)
-            dist = Normal(mean, std)
-            return torch.distributions.kl.kl_divergence(old_dist, dist).mean()
 
         def surrogate_loss():
             log_probs = self.policy.get_log_prob(states, actions)
@@ -185,7 +201,8 @@ class TRPO:
         loss_grad = torch.cat([grad.view(-1) for grad in grads]).detach()
 
         def Fvp(v):
-            kl = get_kl()
+            # Here, we are passing states and old_dist to get_kl
+            kl = self.get_kl(states, old_dist)  # Fixed: pass states and old_dist to get_kl
             kl_grad = torch.autograd.grad(kl, self.policy.parameters(), create_graph=True)
             kl_grad = torch.cat([grad.view(-1) for grad in kl_grad])
             Fv = torch.autograd.grad(torch.sum(kl_grad * v), self.policy.parameters())
@@ -212,7 +229,6 @@ class TRPO:
 
         stepdir = conjugate_gradient(Fvp, -loss_grad)
 
-        # Line search
         shs = 0.5 * torch.dot(stepdir, Fvp(stepdir))
         lm = torch.sqrt(shs / self.max_kl)
         fullstep = stepdir / lm
@@ -227,17 +243,19 @@ class TRPO:
         expected_improve = -torch.dot(loss_grad, fullstep)
         prev_params = torch.cat([param.data.view(-1) for param in self.policy.parameters()])
         
-        success, new_loss = self.line_search(prev_params, fullstep, expected_improve, surrogate_loss)
+        success, new_loss = self.line_search(prev_params, fullstep, expected_improve, surrogate_loss,states, old_dist)
         
         return {
-            'policy_loss': new_loss.item(),
+            'policy_loss': new_loss.item() if success else loss.item(),
             'value_loss': value_loss.item(),
-            'kl_div': get_kl().item()
+            'kl_div': self.get_kl(states, old_dist).item(),  # Fixed: use get_kl here
+            'entropy': entropy
         }
 
-    def line_search(self, prev_params, fullstep, expected_improve, surrogate_loss_func, max_backtracks=10):
+
+    def line_search(self, prev_params, fullstep, expected_improve, surrogate_loss_func, states, old_dist, max_backtracks=10):
         fval = surrogate_loss_func()
-        
+
         for stepfrac in [.5**x for x in range(max_backtracks)]:
             step = stepfrac * fullstep
             idx = 0
@@ -246,19 +264,25 @@ class TRPO:
                 param.data.copy_(prev_params[idx:idx + size].view(param.shape))
                 param.data.add_(step[idx:idx + size].view(param.shape))
                 idx += size
-                
+
             new_loss = surrogate_loss_func()
-            actual_improve = fval - new_loss
-            if actual_improve > 0:
+
+            # Now pass the correct arguments to get_kl
+            kl = self.get_kl(states, old_dist)  # Fixed: use states and old_dist
+
+            # Add acceptance criteria based on both improvement and KL
+            improve = fval - new_loss
+            if improve > 0 and kl <= self.max_kl * 1.5:  # Allow some slack in KL
                 return True, new_loss
-                
+
             idx = 0
             for param in self.policy.parameters():
                 size = param.numel()
                 param.data.copy_(prev_params[idx:idx + size].view(param.shape))
                 idx += size
-                
+
         return False, fval
+
 
     def save_model(self, episode, save_dir="checkpoints"):
         os.makedirs(save_dir, exist_ok=True)
@@ -275,8 +299,15 @@ class Memory:
         self.rewards = []
         self.next_states = []
         self.dones = []
-
+        
     def push(self, state, action, reward, next_state, done):
+   
+        if np.any(np.isnan(state)) or np.any(np.isnan(action)) or np.isnan(reward) or np.any(np.isnan(next_state)):
+            print("Warning: NaN detected in memory push!")
+            return
+            
+        reward = np.clip(reward, -10.0, 10.0)
+        
         self.states.append(state)
         self.actions.append(action)
         self.rewards.append(reward)
@@ -284,6 +315,9 @@ class Memory:
         self.dones.append(done)
 
     def get_batch(self):
+        if len(self.states) == 0:
+            return None
+            
         batch = {
             'states': np.array(self.states),
             'actions': np.array(self.actions),
@@ -328,19 +362,17 @@ class RunningMeanStd:
         self.var = new_var
         self.count = tot_count
 
-
 def train_trpo(
-    max_episodes=10000,
+    max_episodes=20000,
     max_steps=1000,
-    save_interval=1000,
+    save_interval=500,
     eval_freq=10,
-    seed=42
+    seed=42,
+    early_stop_threshold=-150
 ):
     set_seed(seed)
-    
     wandb_config = WandBConfig()
     wandb_config.setup()
-    
     env = gym.make("Ant-v4")
     state_dim = env.observation_space.shape[0]
     action_dim = env.action_space.shape[0]
@@ -351,69 +383,104 @@ def train_trpo(
     agent = TRPO(
         state_dim=state_dim,
         action_dim=action_dim,
-        device=device,
-        gamma=0.99,  # Keep this
-        tau=0.95,    # Reduced from 0.97
-        max_kl=0.005, # Reduced from 0.01
-        damping=0.2,  # Increased from 0.1
-        batch_size=4096, # Increased from 2048
-        value_lr=1e-4   # Reduced from 3e-4
+        device=device
     )
     memory = Memory()
     
+
     training_start_time = time.time()
     episode_rewards = []
+    entropies = []  # Track entropy values
+    best_average_reward = float('-inf')
+    no_improvement_count = 0
+    
     print("\nStarting training...")
     
     for episode in range(max_episodes):
         state, _ = env.reset(seed=seed + episode)
         episode_reward = 0
-        episode_length = 0
+        episode_entropies = []  # Track entropy for this episode
         
+
         for step in range(max_steps):
-            action = agent.select_action(state)
-            next_state, reward, terminated, truncated, _ = env.step(action)
-            done = terminated or truncated
-            
-            memory.push(state, action, reward, next_state, float(done))
-            state = next_state
-            episode_reward += reward
-            episode_length += 1
-            
-            if done:
+            try:
+                # Get action and entropy
+                with torch.no_grad():
+                    state_tensor = torch.FloatTensor(state).unsqueeze(0).to(device)
+                    mean, std = agent.policy(state_tensor)
+                    dist = Normal(mean, std)
+                    entropy = dist.entropy().mean().item()
+                    episode_entropies.append(entropy)
+                
+                action = agent.select_action(state)
+                next_state, reward, terminated, truncated, _ = env.step(action)
+                done = terminated or truncated
+                
+                memory.push(state, action, reward, next_state, float(done))
+                
+                state = next_state
+                episode_reward += reward
+                
+                if done:
+                    break
+                    
+            except Exception as e:
+                print(f"Error during step {step}: {e}")
                 break
         
         episode_rewards.append(episode_reward)
+        avg_episode_entropy = np.mean(episode_entropies) if episode_entropies else 0
+        entropies.append(avg_episode_entropy)
         
-  
+ 
         if len(memory) >= agent.batch_size:
-            train_info = agent.train(memory)
-            
-            metrics = {
-                "Episode": episode,
-                "Reward/Episode": episode_reward,
-                "Reward/Average": np.mean(episode_rewards[-100:]) if len(episode_rewards) >= 100 else np.mean(episode_rewards),
-                "Length/Episode": episode_length,
-                "Loss/Policy": train_info['policy_loss'],
-                "Loss/Value": train_info['value_loss'],
-                "Policy/KL_Divergence": train_info['kl_div'],
-                "Training/Steps": episode * max_steps + step,
-                "Training/Time_Hours": (time.time() - training_start_time) / 3600
-            }
-            
-            wandb.log(metrics)
-        
-        if (episode + 1) % eval_freq == 0:
-            avg_reward = np.mean(episode_rewards[-eval_freq:])
-            print(f"Episode {episode+1}: Average Reward = {avg_reward:.2f}")
+            try:
+                train_info = agent.train(memory)
+                
+          
+                if (episode + 1) % eval_freq == 0:
+                    avg_reward = np.mean(episode_rewards[-eval_freq:])
+                    avg_entropy = np.mean(entropies[-eval_freq:])
+                    
+                    print(f"\nEpisode {episode+1}:")
+                    print(f"Average Reward = {avg_reward:.2f}")
+                    print(f"Policy Loss = {train_info['policy_loss']:.4f}")
+                    print(f"Value Loss = {train_info['value_loss']:.4f}")
+                    print(f"KL Divergence = {train_info['kl_div']:.4f}")
+                    print(f"Average Entropy = {avg_entropy:.4f}")
+                    
+             
+                    if wandb.run is not None:
+                        wandb.log({
+                            "reward": avg_reward,
+                            "policy_loss": train_info['policy_loss'],
+                            "value_loss": train_info['value_loss'],
+                            "kl_div": train_info['kl_div'],
+                            "entropy": avg_entropy
+                        })
+                    
+          
+                    if avg_reward > best_average_reward:
+                        best_average_reward = avg_reward
+                        no_improvement_count = 0
+                        agent.save_model(episode, "best_model")
+                    else:
+                        no_improvement_count += 1
+                    
+              
+                    if no_improvement_count >= 500 and avg_reward < early_stop_threshold:
+                        print("\nStopping early due to lack of improvement...")
+                        break
+                    
+            except Exception as e:
+                print(f"Error during training: {e}")
+                continue
         
         if (episode + 1) % save_interval == 0:
-            agent.save_model(episode + 1)
-    
-    agent.save_model(max_episodes)
+            agent.save_model(episode)
+
     wandb.finish()
     env.close()
-    
     return agent
 
 if __name__ == "__main__":
