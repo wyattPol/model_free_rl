@@ -36,7 +36,7 @@ def set_seed(seed):
 
 class WandBConfig:
     def __init__(self):
-        self.api_key = "a0fc75f04fa27bc24039cf264e6500367853626f"
+        self.api_key = "84e8f4da75becf38a7bfe16d8de8ec9f6b62337f"
         self.project_name = "trpo_ant"
         
     def setup(self):
@@ -54,7 +54,7 @@ class Policy(nn.Module):
         )
         
         self.mean = nn.Linear(256, action_dim)
-        self.log_std = nn.Parameter(torch.zeros(action_dim))
+        self.log_std = nn.Parameter(torch.ones(action_dim) * -0.5) 
         
         # Initialize weights using orthogonal initialization
         for layer in self.net:
@@ -67,9 +67,8 @@ class Policy(nn.Module):
     def forward(self, states):
         x = self.net(states)
         mean = self.mean(x)
-        std = self.log_std.exp()
+        std = self.log_std.exp().clamp(min=1e-6)  # Ensure std is positive
         return mean, std
-
     def get_action(self, state, deterministic=False):
         mean, std = self.forward(state)
         if deterministic:
@@ -94,6 +93,7 @@ class Value(nn.Module):
             nn.Linear(256, 1)
         )
         
+        # Initialize weights
         for layer in self.net:
             if isinstance(layer, nn.Linear):
                 nn.init.orthogonal_(layer.weight, gain=np.sqrt(2))
@@ -135,13 +135,24 @@ class TRPO:
             action = self.policy.get_action(state, deterministic=evaluate)
         return action.cpu().numpy()[0]
 
+    # def get_entropy(self, states):
+    #     """Calculate policy entropy for given states"""
+    #     with torch.no_grad():
+    #         mean, std = self.policy(states)
+    #         dist = Normal(mean, std)
+    #         entropy = dist.entropy().mean()
+    #         return entropy.item()
+
     def get_entropy(self, states):
         """Calculate policy entropy for given states"""
         with torch.no_grad():
             mean, std = self.policy(states)
+            # Add small epsilon to std for numerical stability
+            std = std.clamp(min=1e-6)  # Ensure std is positive
             dist = Normal(mean, std)
             entropy = dist.entropy().mean()
-            return entropy.item()
+            # Safeguard against negative entropy
+            return max(0.0, entropy.item())
 
     def get_kl(self, states, old_dist):
         """Compute the KL divergence between old and new distributions"""
@@ -301,11 +312,12 @@ class Memory:
         self.dones = []
         
     def push(self, state, action, reward, next_state, done):
-   
+        # Validate inputs
         if np.any(np.isnan(state)) or np.any(np.isnan(action)) or np.isnan(reward) or np.any(np.isnan(next_state)):
             print("Warning: NaN detected in memory push!")
             return
             
+        # Clip reward for stability
         reward = np.clip(reward, -10.0, 10.0)
         
         self.states.append(state)
@@ -387,7 +399,7 @@ def train_trpo(
     )
     memory = Memory()
     
-
+    # Initialize monitoring
     training_start_time = time.time()
     episode_rewards = []
     entropies = []  # Track entropy values
@@ -401,7 +413,7 @@ def train_trpo(
         episode_reward = 0
         episode_entropies = []  # Track entropy for this episode
         
-
+        # Episode loop
         for step in range(max_steps):
             try:
                 # Get action and entropy
@@ -432,12 +444,12 @@ def train_trpo(
         avg_episode_entropy = np.mean(episode_entropies) if episode_entropies else 0
         entropies.append(avg_episode_entropy)
         
- 
+        # Train if we have enough samples
         if len(memory) >= agent.batch_size:
             try:
                 train_info = agent.train(memory)
                 
-          
+                # Log training metrics
                 if (episode + 1) % eval_freq == 0:
                     avg_reward = np.mean(episode_rewards[-eval_freq:])
                     avg_entropy = np.mean(entropies[-eval_freq:])
@@ -449,7 +461,7 @@ def train_trpo(
                     print(f"KL Divergence = {train_info['kl_div']:.4f}")
                     print(f"Average Entropy = {avg_entropy:.4f}")
                     
-             
+                    # Log to wandb if you're using it
                     if wandb.run is not None:
                         wandb.log({
                             "reward": avg_reward,
@@ -459,7 +471,7 @@ def train_trpo(
                             "entropy": avg_entropy
                         })
                     
-          
+                    # Check for improvement
                     if avg_reward > best_average_reward:
                         best_average_reward = avg_reward
                         no_improvement_count = 0
@@ -467,7 +479,7 @@ def train_trpo(
                     else:
                         no_improvement_count += 1
                     
-              
+                    # Early stopping
                     if no_improvement_count >= 500 and avg_reward < early_stop_threshold:
                         print("\nStopping early due to lack of improvement...")
                         break
